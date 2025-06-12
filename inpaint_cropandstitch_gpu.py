@@ -3,26 +3,36 @@ import math
 import nodes
 import numpy as np
 import torch
-import torchvision.transforms.functional as F
+#import torchvision.transforms.functional as F
 from PIL import Image
 from scipy.ndimage import gaussian_filter, grey_dilation, binary_closing, binary_fill_holes
-
+import torch.nn.functional as F
 
 def rescale_i(samples, width, height, algorithm: str):
-    samples = samples.movedim(-1, 1)
-    algorithm = getattr(Image, algorithm.upper())  # i.e. Image.BICUBIC
-    samples_pil: Image.Image = F.to_pil_image(samples[0].cpu()).resize((width, height), algorithm)
-    samples = F.to_tensor(samples_pil).unsqueeze(0)
-    samples = samples.movedim(1, -1)
+    # [B, H, W, C] → [B, C, H, W]
+    samples = samples.permute(0, 3, 1, 2)
+
+    mode = algorithm.lower()
+    align_corners = False if mode in ["bilinear", "bicubic"] else None
+
+    # Interpolate on GPU
+    samples = F.interpolate(samples, size=(height, width), mode=mode, align_corners=align_corners)
+
+    # [B, C, H, W] → [B, H, W, C]
+    samples = samples.permute(0, 2, 3, 1)
     return samples
 
 
 def rescale_m(samples, width, height, algorithm: str):
-    samples = samples.unsqueeze(1)
-    algorithm = getattr(Image, algorithm.upper())  # i.e. Image.BICUBIC
-    samples_pil: Image.Image = F.to_pil_image(samples[0].cpu()).resize((width, height), algorithm)
-    samples = F.to_tensor(samples_pil).unsqueeze(0)
-    samples = samples.squeeze(1)
+    if samples.ndim == 3:  # [B, H, W]
+        samples = samples.unsqueeze(1)  # → [B, 1, H, W]
+
+    mode = algorithm.lower()
+    align_corners = False if mode in ["bilinear", "bicubic"] else None
+
+    samples = F.interpolate(samples, size=(height, width), mode=mode, align_corners=align_corners)
+
+    samples = samples.squeeze(1)  # → [B, H, W]
     return samples
 
 
@@ -106,51 +116,96 @@ def preresize_imm(image, mask, optional_context_mask, downscale_algorithm, upsca
 def fillholes_iterative_hipass_fill_m(samples):
     thresholds = [1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
 
-    mask_np = samples.squeeze(0).cpu().numpy()
+    device = samples.device
+    mask_np = samples.squeeze(0).detach().cpu().numpy()
 
     for threshold in thresholds:
         thresholded_mask = mask_np >= threshold
         closed_mask = binary_closing(thresholded_mask, structure=np.ones((3, 3)), border_value=1)
         filled_mask = binary_fill_holes(closed_mask)
-        mask_np = np.maximum(mask_np, np.where(filled_mask != 0, threshold, 0))
+        mask_np = np.maximum(mask_np, np.where(filled_mask, threshold, 0))
 
-    final_mask = torch.from_numpy(mask_np.astype(np.float32)).unsqueeze(0)
-
+    final_mask = torch.from_numpy(mask_np.astype(np.float32)).unsqueeze(0).to(device)
     return final_mask
 
 
 def hipassfilter_m(samples, threshold):
-    filtered_mask = samples.clone()
-    filtered_mask[filtered_mask < threshold] = 0
-    return filtered_mask
+    return torch.where(samples >= threshold, samples, torch.zeros_like(samples))
 
 
 def expand_m(mask, pixels):
     sigma = pixels / 4
-    mask_np = mask.squeeze(0).cpu().numpy()
     kernel_size = math.ceil(sigma * 1.5 + 1)
-    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
-    dilated_mask = grey_dilation(mask_np, footprint=kernel)
-    dilated_mask = dilated_mask.astype(np.float32)
-    dilated_mask = torch.from_numpy(dilated_mask)
-    dilated_mask = torch.clamp(dilated_mask, 0.0, 1.0)
-    return dilated_mask.unsqueeze(0)
+
+    # Build 2D dilation kernel
+    kernel = torch.ones((1, 1, kernel_size, kernel_size), dtype=mask.dtype, device=mask.device)
+
+    # Store original H, W
+    original_shape = mask.shape[-2:]
+
+    # Ensure input shape is [B, 1, H, W]
+    if mask.ndim == 3:  # [1, H, W]
+        mask = mask.unsqueeze(1)
+    elif mask.ndim == 2:  # [H, W]
+        mask = mask.unsqueeze(0).unsqueeze(0)
+    elif mask.ndim == 4 and mask.shape[1] != 1:
+        raise ValueError("expand_m expects a single-channel mask")
+
+    # Perform dilation via convolution
+    expanded = F.conv2d(mask, kernel, padding=kernel_size // 2)
+    expanded = torch.clamp(expanded, 0.0, 1.0)
+
+    # Clamp size to match original input
+    expanded = expanded[..., :original_shape[0], :original_shape[1]]
+
+    return expanded.squeeze(1)  # → [B, H, W]
 
 
 def invert_m(samples):
-    inverted_mask = samples.clone()
-    inverted_mask = 1.0 - inverted_mask
-    return inverted_mask
+    return 1.0 - samples
 
 
-def blur_m(samples, pixels):
-    mask = samples.squeeze(0)
-    sigma = pixels / 4 
-    mask_np = mask.cpu().numpy()
-    blurred_mask = gaussian_filter(mask_np, sigma=sigma)
-    blurred_mask = torch.from_numpy(blurred_mask).float()
-    blurred_mask = torch.clamp(blurred_mask, 0.0, 1.0)
-    return blurred_mask.unsqueeze(0)
+def gaussian_kernel1d(kernel_size: int, sigma: float, device) -> torch.Tensor:
+    half = kernel_size // 2
+    x = torch.arange(-half, half + 1, device=device).float()
+    kernel = torch.exp(-0.5 * (x / sigma) ** 2)
+    kernel /= kernel.sum()
+    return kernel
+
+def blur_m(mask, pixels):
+    sigma = pixels / 4
+    if sigma <= 0:
+        return mask
+
+    # Ensure input shape is [B, C, H, W]
+    while mask.ndim > 4:
+        mask = mask.squeeze(0)
+    if mask.ndim == 2:
+        mask = mask.unsqueeze(0).unsqueeze(0)
+    elif mask.ndim == 3:
+        mask = mask.unsqueeze(0)  # [1, 1, H, W]
+
+    device = mask.device
+    radius = int(3 * sigma + 0.5)
+    kernel_size = 2 * radius + 1
+
+    # Create 1D Gaussian kernel
+    x = torch.arange(-radius, radius + 1, device=device).float()
+    gauss = torch.exp(-0.5 * (x / sigma) ** 2)
+    gauss /= gauss.sum()
+
+    # Expand to 2D separable filters
+    kernel_x = gauss.view(1, 1, 1, -1)  # shape [1,1,1,K]
+    kernel_y = gauss.view(1, 1, -1, 1)  # shape [1,1,K,1]
+
+    # Apply blur: horizontal then vertical
+    padding_x = (0, radius)
+    padding_y = (radius, 0)
+
+    blurred = F.conv2d(mask, kernel_x, padding=padding_x, groups=1)
+    blurred = F.conv2d(blurred, kernel_y, padding=padding_y, groups=1)
+
+    return blurred.squeeze(1)  # shape [B, H, W]
 
 
 def extend_imm(image, mask, optional_context_mask, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor):
@@ -219,10 +274,8 @@ def findcontextarea_m(mask):
         x, y = -1, -1
         w, h = -1, -1
     else:
-        y = torch.min(non_zero_indices[:, 0]).item()
-        x = torch.min(non_zero_indices[:, 1]).item()
-        y_max = torch.max(non_zero_indices[:, 0]).item()
-        x_max = torch.max(non_zero_indices[:, 1]).item()
+        y, x = torch.min(non_zero_indices, dim=0).values[:2].tolist()
+        y_max, x_max = torch.max(non_zero_indices, dim=0).values[:2].tolist()
         w = x_max - x + 1  # +1 to include the max index
         h = y_max - y + 1  # +1 to include the max index
 
@@ -468,6 +521,8 @@ def stitch_magic_im(canvas_image, inpainted_image, mask, ctc_x, ctc_y, ctc_w, ct
     # Clamp mask to [0, 1] and expand to match image channels
     resized_mask = resized_mask.clamp(0, 1).unsqueeze(-1)  # shape: [1, H, W, 1]
 
+    #print("resized_mask stats:", resized_mask.min().item(), resized_mask.max().item(), resized_mask.mean().item())
+
     # Extract the canvas region we're about to overwrite
     canvas_crop = canvas_image[:, ctc_y:ctc_y + ctc_h, ctc_x:ctc_x + ctc_w]
 
@@ -534,7 +589,7 @@ class InpaintCropImproved:
         }
 
     FUNCTION = "inpaint_crop"
-    CATEGORY = "inpaint"
+    CATEGORY = "sjnodes"
     DESCRIPTION = "Crops an image around a mask for inpainting, the optional context mask defines an extra area to keep for the context."
 
 
@@ -700,10 +755,14 @@ class InpaintCropImproved:
         debug_outputs = {name: [] for name in self.RETURN_NAMES if name.startswith("DEBUG_")}
 
         batch_size = image.shape[0]
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        image_dtype = torch.float32 if torch.cuda.is_available() else torch.float32
+        mask_dtype = torch.float32 if torch.cuda.is_available() else torch.float32
+
         for b in range(batch_size):
-            one_image = image[b].unsqueeze(0)
-            one_mask = mask[b].unsqueeze(0)
-            one_optional_context_mask = optional_context_mask[b].unsqueeze(0)
+            one_image = image[b].unsqueeze(0).to(device=device, dtype=image_dtype)
+            one_mask = mask[b].unsqueeze(0).to(device=device, dtype=mask_dtype)
+            one_optional_context_mask = optional_context_mask[b].unsqueeze(0).to(device=device, dtype=mask_dtype)
 
             outputs = self.inpaint_crop_single_image(
                 one_image, downscale_algorithm, upscale_algorithm, preresize, preresize_mode,
@@ -714,19 +773,32 @@ class InpaintCropImproved:
                 output_padding, one_mask, one_optional_context_mask)
 
             stitcher, cropped_image, cropped_mask = outputs[:3]
-            for key in ['canvas_to_orig_x', 'canvas_to_orig_y', 'canvas_to_orig_w', 'canvas_to_orig_h', 'canvas_image', 'cropped_to_canvas_x', 'cropped_to_canvas_y', 'cropped_to_canvas_w', 'cropped_to_canvas_h', 'cropped_mask_for_blend']:
-                result_stitcher[key].append(stitcher[key])
 
-            cropped_image = cropped_image.clone().squeeze(0)
-            result_image.append(cropped_image)
-            cropped_mask = cropped_mask.clone().squeeze(0)
-            result_mask.append(cropped_mask)
+            for key in [
+                'canvas_to_orig_x', 'canvas_to_orig_y', 'canvas_to_orig_w', 'canvas_to_orig_h',
+                'canvas_image', 'cropped_to_canvas_x', 'cropped_to_canvas_y',
+                'cropped_to_canvas_w', 'cropped_to_canvas_h', 'cropped_mask_for_blend'
+            ]:
+                value = stitcher[key]
+                if isinstance(value, torch.Tensor):
+                    value = value.cpu()
 
-            # Handle the DEBUG_ fields dynamically
-            for name, output in zip(self.RETURN_NAMES[3:], outputs[3:]):  # Start from index 3 since first 3 are fixed
+                    # Optimize memory for large tensors
+                    if key == 'canvas_image':
+                        value = value.to(torch.float16)  # still normalized float16
+                    elif key == 'cropped_mask_for_blend':
+                        value = (value.clamp(0, 1) * 255).to(torch.uint8)  # convert to uint8 mask
+                    else:
+                        value = value.clone()
+
+                result_stitcher[key].append(value)
+
+            result_image.append(cropped_image.cpu().squeeze(0).to(torch.float16))
+            result_mask.append((cropped_mask.cpu().squeeze(0).clamp(0, 1) * 255).to(torch.uint8))
+
+            for name, output in zip(self.RETURN_NAMES[3:], outputs[3:]):
                 if name.startswith("DEBUG_"):
-                    output_array = output.squeeze(0)  # Assuming output needs to be squeezed similar to image/mask
-                    debug_outputs[name].append(output_array)
+                    debug_outputs[name].append(output.cpu().squeeze(0))
 
         result_image = torch.stack(result_image, dim=0)
         result_mask = torch.stack(result_mask, dim=0)
@@ -737,6 +809,10 @@ class InpaintCropImproved:
             print(result_mask.shape, type(result_mask), result_mask.dtype)
 
         debug_outputs = {name: torch.stack(values, dim=0) for name, values in debug_outputs.items()}
+
+        # Free up memory
+        del one_image, one_mask, one_optional_context_mask, outputs, stitcher, value, cropped_image, cropped_mask
+        torch.cuda.empty_cache()
 
         return result_stitcher, result_image, result_mask, *[debug_outputs[name] for name in self.RETURN_NAMES if name.startswith("DEBUG_")]
 
@@ -851,12 +927,6 @@ class InpaintCropImproved:
 
 
 class InpaintStitchImproved:
-    """
-    ComfyUI-InpaintCropAndStitch
-    https://github.com/lquesada/ComfyUI-InpaintCropAndStitch
-
-    This node stitches the inpainted image without altering unmasked areas.
-    """
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -866,61 +936,59 @@ class InpaintStitchImproved:
             }
         }
 
-    CATEGORY = "inpaint"
+    CATEGORY = "sjnodes"
     DESCRIPTION = "Stitches an image cropped with Inpaint Crop back into the original image"
-
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("image",)
-
     FUNCTION = "inpaint_stitch"
-
 
     def inpaint_stitch(self, stitcher, inpainted_image):
         inpainted_image = inpainted_image.clone()
         results = []
 
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        inpainted_image = inpainted_image.to(device)
+
         batch_size = inpainted_image.shape[0]
-        assert len(stitcher['cropped_to_canvas_x']) == batch_size or len(stitcher['cropped_to_canvas_x']) == 1, "Stitch batch size doesn't match image batch size"
-        override = False
-        if len(stitcher['cropped_to_canvas_x']) != batch_size and len(stitcher['cropped_to_canvas_x']) == 1:
-            override = True
+        override = len(stitcher['cropped_to_canvas_x']) == 1
+
         for b in range(batch_size):
-            one_image = inpainted_image[b]
+            one_image = inpainted_image[b].unsqueeze(0)
             one_stitcher = {}
+
+            # Copy static (non-batched) stitch parameters
             for key in ['downscale_algorithm', 'upscale_algorithm', 'blend_pixels']:
                 one_stitcher[key] = stitcher[key]
-            for key in ['canvas_to_orig_x', 'canvas_to_orig_y', 'canvas_to_orig_w', 'canvas_to_orig_h', 'canvas_image', 'cropped_to_canvas_x', 'cropped_to_canvas_y', 'cropped_to_canvas_w', 'cropped_to_canvas_h', 'cropped_mask_for_blend']:
-                if override: # One stitcher for many images, always read 0.
-                    one_stitcher[key] = stitcher[key][0]
-                else:
-                    one_stitcher[key] = stitcher[key][b]
-            one_image = one_image.unsqueeze(0)
-            one_image, = self.inpaint_stitch_single_image(one_stitcher, one_image)
-            one_image = one_image.squeeze(0)
-            one_image = one_image.clone()
-            results.append(one_image)
+
+            # Copy and convert per-sample fields
+            for key in [
+                'canvas_to_orig_x', 'canvas_to_orig_y', 'canvas_to_orig_w', 'canvas_to_orig_h',
+                'canvas_image', 'cropped_to_canvas_x', 'cropped_to_canvas_y',
+                'cropped_to_canvas_w', 'cropped_to_canvas_h', 'cropped_mask_for_blend'
+            ]:
+                value = stitcher[key][0] if override else stitcher[key][b]
+
+                if isinstance(value, torch.Tensor):
+                    value = value.to(device)
+                    if key == 'canvas_image' and value.dtype == torch.float16:
+                        value = value.to(dtype=torch.float32)
+                    elif key == 'cropped_mask_for_blend' and value.dtype == torch.uint8:
+                        value = value.to(dtype=torch.float32) / 255.0
+
+                one_stitcher[key] = value
+
+            stitched_image, = self.inpaint_stitch_single_image(one_stitcher, one_image)
+            results.append(stitched_image.squeeze(0).clone().cpu())
 
         result_batch = torch.stack(results, dim=0)
-
         return (result_batch,)
 
     def inpaint_stitch_single_image(self, stitcher, inpainted_image):
-        downscale_algorithm = stitcher['downscale_algorithm']
-        upscale_algorithm = stitcher['upscale_algorithm']
-        canvas_image = stitcher['canvas_image']
-
-        ctc_x = stitcher['cropped_to_canvas_x']
-        ctc_y = stitcher['cropped_to_canvas_y']
-        ctc_w = stitcher['cropped_to_canvas_w']
-        ctc_h = stitcher['cropped_to_canvas_h']
-
-        cto_x = stitcher['canvas_to_orig_x']
-        cto_y = stitcher['canvas_to_orig_y']
-        cto_w = stitcher['canvas_to_orig_w']
-        cto_h = stitcher['canvas_to_orig_h']
-
-        mask = stitcher['cropped_mask_for_blend']  # shape: [1, H, W]
-
-        output_image = stitch_magic_im(canvas_image, inpainted_image, mask, ctc_x, ctc_y, ctc_w, ctc_h, cto_x, cto_y, cto_w, cto_h, downscale_algorithm, upscale_algorithm)
-
-        return (output_image,)
+        return (stitch_magic_im(
+            stitcher['canvas_image'], inpainted_image, stitcher['cropped_mask_for_blend'],
+            stitcher['cropped_to_canvas_x'], stitcher['cropped_to_canvas_y'],
+            stitcher['cropped_to_canvas_w'], stitcher['cropped_to_canvas_h'],
+            stitcher['canvas_to_orig_x'], stitcher['canvas_to_orig_y'],
+            stitcher['canvas_to_orig_w'], stitcher['canvas_to_orig_h'],
+            stitcher['downscale_algorithm'], stitcher['upscale_algorithm']
+        ),)
