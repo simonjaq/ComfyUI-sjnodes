@@ -3,6 +3,8 @@ import math
 import nodes
 import numpy as np
 import torch
+import os
+import folder_paths
 #import torchvision.transforms.functional as F
 from PIL import Image
 from scipy.ndimage import gaussian_filter, grey_dilation, binary_closing, binary_fill_holes
@@ -547,8 +549,8 @@ class InpaintCropImproved:
                 "image": ("IMAGE",),
 
                 # Resize algorithms
-                "downscale_algorithm": (["nearest", "bilinear", "bicubic", "lanczos", "box", "hamming"], {"default": "bilinear"}),
-                "upscale_algorithm": (["nearest", "bilinear", "bicubic", "lanczos", "box", "hamming"], {"default": "bicubic"}),
+                "downscale_algorithm": (["nearest", "bilinear", "bicubic", "area", "nearest-exact"], {"default": "bilinear"}),
+                "upscale_algorithm":   (["nearest", "bilinear", "bicubic", "area", "nearest-exact"], {"default": "bicubic"}),
 
                 # Pre-resize input image
                 "preresize": ("BOOLEAN", {"default": False, "tooltip": "Resize the original image before processing."}),
@@ -992,3 +994,201 @@ class InpaintStitchImproved:
             stitcher['canvas_to_orig_w'], stitcher['canvas_to_orig_h'],
             stitcher['downscale_algorithm'], stitcher['upscale_algorithm']
         ),)
+    
+
+
+
+class SaveStitcherToFile:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "stitcher": ("STITCHER",),
+                "filename": ("STRING", {"default": "stitcher_backup.pt"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("file_path",)
+    FUNCTION = "save"
+    CATEGORY = "sjnodes/utils"
+
+    def save(self, stitcher, filename):
+        output_dir = folder_paths.get_output_directory()
+        os.makedirs(output_dir, exist_ok=True)
+
+        full_path = os.path.join(output_dir, filename)
+
+        safe_stitcher = {}
+        for k, v in stitcher.items():
+            if isinstance(v, list):
+                safe_stitcher[k] = [x.cpu() if isinstance(x, torch.Tensor) else x for x in v]
+            else:
+                safe_stitcher[k] = v
+
+        torch.save(safe_stitcher, full_path)
+
+        return (full_path,)
+
+
+class LoadStitcherFromFile:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "file_path": ("STRING", {"default": os.path.join("output", "stitcher_backup.pt")}),
+            }
+        }
+
+    RETURN_TYPES = ("STITCHER",)
+    RETURN_NAMES = ("stitcher",)
+    FUNCTION = "load"
+    CATEGORY = "sjnodes/utils"
+
+    def load(self, file_path):
+        stitcher = torch.load(file_path, map_location="cpu")
+        return (stitcher,)
+    
+
+
+class SmoothTemporalMask:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "masks": ("MASK",),
+                "mode": (["mask", "box"], {"default": "mask"}),
+                "smoothing_window": ("INT", {"default": 5, "min": 1, "max": 99}),
+                "threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0}),
+                "min_expansion_px": ("INT", {"default": 4, "min": 0, "max": 64}),
+                "smoothing_alpha": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0}),
+            }
+        }
+
+    CATEGORY = "sjnodes/mask"
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("smoothed_mask",)
+    FUNCTION = "smooth"
+
+    def smooth(self, masks, mode, smoothing_window, threshold, min_expansion_px, smoothing_alpha):
+        if masks.dim() == 4 and masks.shape[1] == 1:
+            masks = masks[:, 0]
+        elif masks.dim() != 3:
+            raise ValueError("Expected mask tensor of shape [B, H, W] or [B, 1, H, W]")
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        masks = masks.to(device)
+        B, H, W = masks.shape
+        dtype = masks.dtype
+
+        if mode == "mask":
+            if min_expansion_px > 0:
+                kernel_size = min_expansion_px * 2 + 1
+                kernel = torch.ones((1, 1, kernel_size, kernel_size), device=device, dtype=dtype)
+                expanded = F.conv2d(masks.unsqueeze(1), kernel, padding=min_expansion_px)
+                expanded = (expanded > 0).float().squeeze(1)
+            else:
+                expanded = masks
+
+            temporal = expanded.permute(1, 2, 0).reshape(-1, 1, B)
+            kernel = torch.ones(1, 1, smoothing_window, device=device, dtype=dtype) / smoothing_window
+            smoothed = F.conv1d(temporal, kernel, padding=smoothing_window // 2)
+            smoothed = smoothed.reshape(H, W, B).permute(2, 0, 1)
+            result = (smoothed > threshold).float().to("cpu")
+
+        elif mode == "box":
+            result = torch.zeros_like(masks, device="cpu")
+            prev_cx, prev_cy, prev_w, prev_h = None, None, None, None
+
+            for i in range(B):
+                mask = masks[i]
+                nonzero = torch.nonzero(mask > threshold, as_tuple=False)
+                if nonzero.numel() == 0:
+                    continue
+
+                y_min, x_min = nonzero.min(dim=0).values
+                y_max, x_max = nonzero.max(dim=0).values
+
+                cx = (x_min + x_max) / 2.0
+                cy = (y_min + y_max) / 2.0
+                w = x_max - x_min
+                h = y_max - y_min
+
+                if prev_cx is None:
+                    scx, scy, sw, sh = cx, cy, w, h
+                else:
+                    scx = smoothing_alpha * cx + (1 - smoothing_alpha) * prev_cx
+                    scy = smoothing_alpha * cy + (1 - smoothing_alpha) * prev_cy
+                    sw = smoothing_alpha * w + (1 - smoothing_alpha) * prev_w
+                    sh = smoothing_alpha * h + (1 - smoothing_alpha) * prev_h
+
+                prev_cx, prev_cy, prev_w, prev_h = scx, scy, sw, sh
+
+                half_w = sw / 2 + min_expansion_px
+                half_h = sh / 2 + min_expansion_px
+                x1 = int(torch.clamp(scx - half_w, 0, W - 1))
+                x2 = int(torch.clamp(scx + half_w, 0, W - 1))
+                y1 = int(torch.clamp(scy - half_h, 0, H - 1))
+                y2 = int(torch.clamp(scy + half_h, 0, H - 1))
+
+                result[i, y1:y2, x1:x2] = 1.0
+
+        torch.cuda.empty_cache()
+        return (result,)
+    
+
+class CrossFadeVideo:
+    """
+    Crossfades two batches of images over a specified number of frames.
+    The output sequence contains:
+    - all frames from images_1 except the last `fade_len`
+    - `fade_len` blended frames between images_1 and images_2
+    - all frames from images_2 starting after the `fade_len`
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images_1": ("IMAGE",),
+                "images_2": ("IMAGE",),
+                "fade_len": ("INT", {"default": 8, "min": 1, "max": 1024}),
+                "interpolation": (["linear", "ease_in", "ease_out", "ease_in_out"],),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("faded_video",)
+    FUNCTION = "crossfade_video"
+    CATEGORY = "video/transition"
+
+    def crossfade_video(self, images_1, images_2, fade_len, interpolation):
+        assert images_1.shape[0] >= fade_len, "images_1 too short"
+        assert images_2.shape[0] >= fade_len, "images_2 too short"
+
+        start_1 = images_1[:-fade_len]
+        end_1 = images_1[-fade_len:]
+        start_2 = images_2[:fade_len]
+        rest_2 = images_2[fade_len:]
+
+        easing_fn = self.get_easing_fn(interpolation)
+        alphas = torch.linspace(0, 1, fade_len)
+        alphas = torch.tensor([easing_fn(a.item()) for a in alphas], dtype=images_1.dtype)
+
+        fade = [(1 - alpha) * img1 + alpha * img2 for img1, img2, alpha in zip(end_1, start_2, alphas)]
+        fade = torch.stack(fade)
+
+        result = torch.cat([start_1, fade, rest_2], dim=0)
+        return (result,)
+
+    def get_easing_fn(self, name):
+        if name == "linear":
+            return lambda t: t
+        elif name == "ease_in":
+            return lambda t: t * t
+        elif name == "ease_out":
+            return lambda t: 1 - (1 - t) * (1 - t)
+        elif name == "ease_in_out":
+            return lambda t: 3 * t * t - 2 * t * t * t
+        else:
+            return lambda t: t  # fallback
