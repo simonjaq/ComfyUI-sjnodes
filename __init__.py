@@ -1,5 +1,5 @@
 from .inpaint_cropandstitch_gpu import InpaintCropImproved, InpaintStitchImproved, SaveStitcherToFile, LoadStitcherFromFile, SmoothTemporalMask, CrossFadeVideo
-from .nodes import WanVideoVACEExtend
+from .nodes import WanVideoVACEExtend, LogCRec709Convert
 
 WEB_DIRECTORY = "js"
 
@@ -11,6 +11,7 @@ NODE_CLASS_MAPPINGS = {
     "SmoothTemporalMask" : SmoothTemporalMask,
     "CrossFadeVideo" : CrossFadeVideo,
     "WanVideoVACEExtend" : WanVideoVACEExtend,
+    "LogCRec709Convert" : LogCRec709Convert,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -21,6 +22,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SmoothTemporalMask" : "SmoothTemporalMask",
     "CrossFadeVideo" : "CrossFadeVideo",
     "WanVideoVACEExtend" : "WanVideoVACEExtend",
+    "LogCRec709Convert" : "LogCRec709Convert",
 }
 
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
