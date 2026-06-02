@@ -4,8 +4,6 @@ ComfyUI-Inpaint-CropAndStitch - Modified for GPU
 
 Copyright (c) 2024-2025, Luis Quesada Torres - https://github.com/lquesada | www.luisquesada.com
 
-Check ComfyUI here: https://github.com/comfyanonymous/ComfyUI
+Some modified nodes based on: https://github.com/kijai/ComfyUI-WanVideoWrapper
 
-
-# License
-GNU GENERAL PUBLIC LICENSE Version 3, see [LICENSE](LICENSE)
+Highly experimental. Use at your own risk.
