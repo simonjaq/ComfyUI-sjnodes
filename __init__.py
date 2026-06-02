@@ -11,6 +11,7 @@ from .nodes import (
     SJAlwaysChanged,
     SJPathListDirLive,
 )
+from .distributed_batch import SJDistributedImageBatch
 
 WEB_DIRECTORY = "js"
 
@@ -31,6 +32,7 @@ NODE_CLASS_MAPPINGS = {
     "SmartVideoTrim": SmartVideoTrim,
     "SJAlwaysChanged": SJAlwaysChanged,
     "SJPathListDirLive": SJPathListDirLive,
+    "SJDistributedImageBatch": SJDistributedImageBatch,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -50,6 +52,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SmartVideoTrim": "✂️ Smart Video Trim",
     "SJAlwaysChanged": "🔁 Always Changed Trigger",
     "SJPathListDirLive": "📁 List Directory (Live)",
+    "SJDistributedImageBatch": "🛰️ SJ Distributed Image Batch",
 }
 
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
